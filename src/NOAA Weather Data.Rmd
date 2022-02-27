@@ -1,0 +1,470 @@
+
+---
+title: "NOAA Data Preparation"
+author: "Steven Lio, Patricia Luo"
+date: "1/29/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(rnoaa)
+library(ggplot2)
+library(plotly)
+
+library(tidyverse)
+library(broom)
+library(lubridate)
+library(forecast)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Weather Data Preparation
+
+Procedure to prepare NOAA weather data.
+
+## Function to fetch station data
+```{r}
+get_station_data <- function (stationid) {
+  ghcnd_search(stationid = stationid, var = "all", 
+               date_min = "1950-01-01", date_max = Sys.Date())
+}
+```
+
+
+## Function to fetch all data given station id
+```{r}
+get_data <- function(station_ids,verbose=FALSE) {
+  weather_data <- tibble(id=as.character(),
+                         location=as.character(),
+                         var=as.character(),
+                         value=as.numeric(),
+                         date=as.Date(NA),
+                         mflag=as.character(),
+                         qflag=as.character(),
+                         sflag=as.character()
+                         )
+  
+  for (s in 1:nrow(station_id)){
+    if (verbose) {print(paste0("Fetching data for location: ",station_id[s,]$location))}
+    a <- get_station_data(station_id[s,]$id)
+    
+    for (i in 1:length(a)){
+      if (verbose) {
+        print(paste0("Variable: ",colnames(a[[i]])[2]))
+        print(paste0("Rows: ",nrow(a[[i]])))
+      }
+      
+      weather_data <- weather_data %>%
+        add_row(id = a[[i]]$id,
+                location = rep(station_id[s,]$location,nrow(a[[i]])),
+                var = colnames(a[[i]])[2],
+                value = a[[i]][,colnames(a[[i]])[2]] %>% pull(),
+                date = a[[i]]$date,
+                mflag = a[[i]]$mflag,
+                qflag = a[[i]]$qflag,
+                sflag = a[[i]]$sflag)
+      if (verbose) {
+        print("")
+      }
+    }
+  }
+  
+  weather_data
+}
+```
+
+## List of station ID to be fetch
+```{r}
+station_id <- tibble(location=c("Washington DC","Liestal","Kyoto","Vancouver"),
+                     id = c("USC00186350","GME00127786","JA000047759","CA001108395"))
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+weather_data <- get_data(station_id)
+```
+
+## Data restructure and expand data to include missing dates.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+var_impute <- unique(weather_data %>% select(id, var))
+weather_data_complete <- weather_data[0,]
+
+for (i in 1:nrow(var_impute)){
+  print(paste0("Complete series for ",var_impute[i,1] %>% pull(),", variable: ",var_impute[i,2]))
+  ts_raw <- weather_data %>% 
+    filter(id==var_impute[i,1] %>% pull(),
+           var==var_impute[i,2] %>% pull())
+  
+  ts_complete_row <-  ts_raw %>%
+    complete(date = seq.Date(min(date), max(date), by="day")) %>%
+    mutate(id=ifelse(is.na(id),unique(na.omit(id)),id),
+           location=ifelse(is.na(location),unique(na.omit(location)),location),
+           var=ifelse(is.na(var),unique(na.omit(var)),var),
+           value=ifelse(var %in% c("tmax","tmin","prcp","tobs","wesd","tavg","wsfg"),value/10,value),
+           mflag = ifelse(is.na(mflag)," ",mflag),
+           qflag = ifelse(is.na(qflag)," ",qflag),
+           sflag = ifelse(is.na(sflag)," ",sflag)
+    )
+  
+  weather_data_complete <- weather_data_complete %>%
+    add_row(ts_complete_row)
+  
+  new_row <- weather_data_complete %>% 
+    filter(id==var_impute[i,1] %>% pull(),
+           var==var_impute[i,2] %>% pull()) %>%
+    nrow()
+  
+  print(paste0("Original: ",nrow(ts_raw)," rows. New: ",new_row))
+}
+
+weather_data_complete_summary <- weather_data_complete %>%
+  group_by(id, location, var) %>%
+  summarise(dt.min = min(date),
+            dt.max = max(date),
+            missing_dt = n() - (max(date)-min(date)+1),
+            cnt = n(),
+            val.na = sum(is.na(value)),
+            val.min = min(na.omit(value)),
+            val.max = max(na.omit(value)),
+            val.avg = mean(na.omit(value)),
+            val.sd = sd(na.omit(value))
+            )
+
+if (weather_data_complete_summary %>% filter(missing_dt > 0) %>% nrow() > 0){
+  print("Still have missing data")
+}
+```
+## Plot for `tmax` by locations
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=7, fig.height=8}
+plt_data <- weather_data_complete %>% filter(var == "tmax" & date >= "2010-01-01") %>% mutate(location=factor(location))
+plt_data%>%
+  group_by(location) %>%
+  do(p=plot_ly(., x = ~date, y = ~value, color = ~location, type = "scatter",mode="lines")) %>%
+  subplot(nrows = 4, shareX = TRUE, shareY = TRUE)
+```
+
+## Imputation and Prediction function for `tmax` using Linear Regression (with sine and cosine terms) and ARIMA.
+```{r}
+ma<-function(x, window=5, incl=TRUE, method="center"){
+  ma_x <- c()
+  
+  for (i in 1:length(x)){
+    if (method=="center"){
+      ma_x[i]<-mean(x[max(1,i-window):min(length(x),i+window)],na.rm=TRUE)
+      ma_x[i]<-ifelse(is.na(ma_x[i]),NA,ma_x[i])
+    } else if (method=="forward") {
+      ma_x[i]<-mean(x[max(1,j-window+1):j],na.rm=TRUE)
+      ma_x[i]<-ifelse(is.na(ma_x[i]),NA,ma_x[i])
+    } else if (method=="backward") {
+      ma_x[i]<-mean(x[length(x):1][max(1,j-window+1):j],na.rm=TRUE)
+      ma_x[i]<-ifelse(is.na(ma_x[i]),NA,ma_x[i])
+    }
+  }
+  return(ma_x)
+}
+
+var_predict <- function(df, end_date="2031-12-31", max_freq=50,biasweight=0.9) {
+  
+  #df <- tmax_df
+  #end_date <- "2031-12-31"
+  #max_freq = 10
+  
+  var_df <- df %>% 
+    mutate(value_impute = ifelse(is.na(df$value),lag(df$value, 365),df$value))
+  var_df <- df %>% 
+    mutate(value_impute = ifelse(is.na(df$value_impute),lead(df$value_impute, 365),df$value_impute))
+  
+  pred_date <- seq.Date(from=min(var_df$date),to=as.Date(end_date), by = "day")
+  day_num <- 1:length(pred_date) 
+  doy<-yday(pred_date)
+  
+  var_pred <- tibble(id = unique(na.omit(var_df$id)),
+                      location = unique(na.omit(var_df$location)),
+                      var = unique(na.omit(var_df$var)),
+                      date = pred_date,
+                      day_num = day_num,
+                      doy = doy,
+                      value = c(var_df$value,rep(NA,as.Date(end_date) - max(var_df$date))),
+                      value_impute = c(var_df$value_impute,rep(NA,as.Date(end_date) - max(var_df$date))))
+  
+  #LM
+  print("Running Linear Regression")
+  lm_df <- var_pred %>% 
+              select(date, day_num,doy, value_impute) %>%
+              na.omit()
+  
+  ssp<-spectrum(lm_df$value_impute,plot=FALSE)
+  n_per <- min(max_freq,length(ssp$freq))
+  per <- 1/ssp$freq[order(-ssp$spec)][1:n_per]
+  sincos <-""
+  for (i in 1:n_per){
+    sincos<-paste(sincos, "+sin(2*pi/",per[i],"*day_num)+cos(2*pi/",per[i],"*day_num)+sin(2*pi/",per[i],"*doy)+cos(2*pi/",per[i],"*doy)",sep="")
+  }
+  Linear <- lm(as.formula(paste0("value_impute~",sincos)),data=lm_df)
+  
+  var_pred$LM.pred <- predict(Linear,var_pred)
+
+  var_pred$LM.predbias <- var_pred %>% 
+  mutate(resid=value_impute-LM.pred) %>%
+  group_by(doy) %>%
+  mutate(bias = sample(na.omit(resid),1),
+         LM.predbias=LM.pred + bias*biasweight) %>%
+  ungroup() %>% select(LM.predbias) %>% pull()
+  
+  #print("Running ARIMA")
+  #ARIMA
+  #var_arima <- stlf(ts(var_df$value_impute,start=min(var_df$date),frequency=365),
+                     #h=(as.Date(end_date) - max(var_df$date)),method="arima")
+  
+  #bias <-sample(var_df$value_impute-var_arima$fitted, length(var_arima$mean))
+  #var_pred$ARIMA.pred <- c(var_arima$fitted, var_arima$mean)
+  #var_pred$ARIMA.predbias <- c(var_arima$fitted, var_arima$mean + bias*0.8)
+  
+  return(var_pred)
+}
+```
+
+
+
+## Predict tmax for Washington DC
+
+```{r}
+tmax_df <- weather_data_complete %>%
+  filter(var == "tmax" & location == "Washington DC") %>%
+  mutate(day_num = 1:n(),
+         doy = yday(date),
+         na.flag=is.na(value),
+         value_impute = value
+         )
+
+tmax_pred <- var_predict(tmax_df, end_date="2031-12-31", max_freq=150, biasweight=0.8)
+
+weather_data_complete_washington <- bind_rows(
+weather_data_complete %>% 
+    filter(location=="Washington DC") %>%
+    select(id, location, date, var, value)
+,
+tmax_pred %>% select(id,location,date,value_impute,LM.pred,LM.predbias) %>%
+  pivot_longer(cols=c(value_impute,LM.pred,LM.predbias),names_to="var",values_to="value")) %>%
+                      
+    pivot_wider(names_from=var, values_from = value) %>% 
+  mutate(year=year(date),
+           qtr=paste0("Q",quarter(date)),
+           month=month(date),
+           day_num = 1:n(),
+           doy = yday(date),
+         tmax_impute=value_impute,
+           tmax_LM_pred=LM.pred,
+         tmax_LM_predbias=LM.predbias)
+
+fig <- plot_ly(data=tmax_pred,x=~date,y=~value,type="scatter",mode="lines",name="original")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~ma(value_impute,window=2),type="scatter",mode="lines",name="MA")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~LM.pred,type="scatter",mode="lines",name="LM")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~LM.predbias,type="scatter",mode="lines",name="LMBias")
+fig
+
+
+sqrt(mean((tmax_pred$value-tmax_pred$LM.pred)^2,na.rm=TRUE))
+sqrt(mean((tmax_pred$value-tmax_pred$LM.predbias)^2,na.rm=TRUE))
+sqrt(mean((ma(tmax_pred$value_impute,window=7)-tmax_pred$LM.pred)^2,na.rm=TRUE))
+sqrt(mean((ma(tmax_pred$value_impute,window=7)-tmax_pred$LM.predbias)^2,na.rm=TRUE))
+
+
+fig<-plot_ly(data=tmax_pred,x=~value_impute,type="histogram",histnorm="probability",name="ori")
+fig <- fig %>% add_trace(data=tmax_pred,x=~LM.pred,type="histogram",histnorm="probability",name="LM")
+fig <- fig %>% add_trace(data=tmax_pred,x=~LM.predbias,type="histogram",histnorm="probability",name="LMbias")
+fig
+```
+
+## Predict tmax for Liestal
+
+```{r}
+tmax_df <- weather_data_complete %>%
+  filter(var == "tmax" & location == "Liestal") %>%
+  mutate(day_num = 1:n(),
+         doy = yday(date),
+         na.flag=is.na(value),
+         value_impute = value
+         )
+
+tmax_pred <- var_predict(tmax_df, end_date="2031-12-31", max_freq=150, biasweight=0.8)
+
+weather_data_complete_liestal <- bind_rows(
+weather_data_complete %>% 
+    filter(location=="Liestal") %>%
+    select(id, location, date, var, value)
+,
+tmax_pred %>% select(id,location,date,value_impute,LM.pred,LM.predbias) %>%
+  pivot_longer(cols=c(value_impute,LM.pred,LM.predbias),names_to="var",values_to="value")) %>%
+                      
+    pivot_wider(names_from=var, values_from = value) %>% 
+  mutate(year=year(date),
+           qtr=paste0("Q",quarter(date)),
+           month=month(date),
+           day_num = 1:n(),
+           doy = yday(date),
+         tmax_impute=value_impute,
+           tmax_LM_pred=LM.pred,
+         tmax_LM_predbias=LM.predbias)
+
+fig <- plot_ly(data=tmax_pred,x=~date,y=~value,type="scatter",mode="lines",name="original")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~ma(value_impute,window=2),type="scatter",mode="lines",name="MA")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~LM.pred,type="scatter",mode="lines",name="LM")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~LM.predbias,type="scatter",mode="lines",name="LMBias")
+fig
+
+
+sqrt(mean((tmax_pred$value-tmax_pred$LM.pred)^2,na.rm=TRUE))
+sqrt(mean((tmax_pred$value-tmax_pred$LM.predbias)^2,na.rm=TRUE))
+sqrt(mean((ma(tmax_pred$value_impute,window=7)-tmax_pred$LM.pred)^2,na.rm=TRUE))
+sqrt(mean((ma(tmax_pred$value_impute,window=7)-tmax_pred$LM.predbias)^2,na.rm=TRUE))
+
+
+fig<-plot_ly(data=tmax_pred,x=~value_impute,type="histogram",histnorm="probability",name="ori")
+fig <- fig %>% add_trace(data=tmax_pred,x=~LM.pred,type="histogram",histnorm="probability",name="LM")
+fig <- fig %>% add_trace(data=tmax_pred,x=~LM.predbias,type="histogram",histnorm="probability",name="LMbias")
+fig
+```
+
+## Predict tmax for Kyoto
+
+```{r}
+tmax_df <- weather_data_complete %>%
+  filter(var == "tmax" & location == "Kyoto") %>%
+  mutate(day_num = 1:n(),
+         doy = yday(date),
+         na.flag=is.na(value),
+         value_impute = value
+         )
+
+tmax_pred <- var_predict(tmax_df, end_date="2031-12-31", max_freq=150, biasweight=0.8)
+
+weather_data_complete_kyoto <- bind_rows(
+weather_data_complete %>% 
+    filter(location=="Kyoto") %>%
+    select(id, location, date, var, value)
+,
+tmax_pred %>% select(id,location,date,value_impute,LM.pred,LM.predbias) %>%
+  pivot_longer(cols=c(value_impute,LM.pred,LM.predbias),names_to="var",values_to="value")) %>%
+                      
+    pivot_wider(names_from=var, values_from = value) %>% 
+  mutate(year=year(date),
+           qtr=paste0("Q",quarter(date)),
+           month=month(date),
+           day_num = 1:n(),
+           doy = yday(date),
+         tmax_impute=value_impute,
+           tmax_LM_pred=LM.pred,
+         tmax_LM_predbias=LM.predbias)
+
+fig <- plot_ly(data=tmax_pred,x=~date,y=~value,type="scatter",mode="lines",name="original")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~ma(value_impute,window=2),type="scatter",mode="lines",name="MA")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~LM.pred,type="scatter",mode="lines",name="LM")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~LM.predbias,type="scatter",mode="lines",name="LMBias")
+fig
+
+
+sqrt(mean((tmax_pred$value-tmax_pred$LM.pred)^2,na.rm=TRUE))
+sqrt(mean((tmax_pred$value-tmax_pred$LM.predbias)^2,na.rm=TRUE))
+sqrt(mean((ma(tmax_pred$value_impute,window=7)-tmax_pred$LM.pred)^2,na.rm=TRUE))
+sqrt(mean((ma(tmax_pred$value_impute,window=7)-tmax_pred$LM.predbias)^2,na.rm=TRUE))
+
+
+fig<-plot_ly(data=tmax_pred,x=~value_impute,type="histogram",histnorm="probability",name="ori")
+fig <- fig %>% add_trace(data=tmax_pred,x=~LM.pred,type="histogram",histnorm="probability",name="LM")
+fig <- fig %>% add_trace(data=tmax_pred,x=~LM.predbias,type="histogram",histnorm="probability",name="LMbias")
+fig
+```
+
+## Predict tmax for Vancouver
+
+```{r}
+tmax_df <- weather_data_complete %>%
+  filter(var == "tmax" & location == "Vancouver") %>%
+  mutate(day_num = 1:n(),
+         doy = yday(date),
+         na.flag=is.na(value),
+         value_impute = value
+         )
+
+tmax_pred <- var_predict(tmax_df, end_date="2031-12-31", max_freq=150, biasweight=0.8)
+
+weather_data_complete_vancouver <- bind_rows(
+weather_data_complete %>% 
+    filter(location=="Vancouver") %>%
+    select(id, location, date, var, value)
+,
+tmax_pred %>% select(id,location,date,value_impute,LM.pred,LM.predbias) %>%
+  pivot_longer(cols=c(value_impute,LM.pred,LM.predbias),names_to="var",values_to="value")) %>%
+                      
+    pivot_wider(names_from=var, values_from = value) %>% 
+  mutate(year=year(date),
+           qtr=paste0("Q",quarter(date)),
+           month=month(date),
+           day_num = 1:n(),
+           doy = yday(date),
+         tmax_impute=value_impute,
+           tmax_LM_pred=LM.pred,
+         tmax_LM_predbias=LM.predbias)
+
+fig <- plot_ly(data=tmax_pred,x=~date,y=~value,type="scatter",mode="lines",name="original")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~ma(value_impute,window=2),type="scatter",mode="lines",name="MA")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~LM.pred,type="scatter",mode="lines",name="LM")
+fig <- fig %>% add_trace(data=tmax_pred,x=~date,y=~LM.predbias,type="scatter",mode="lines",name="LMBias")
+fig
+
+
+sqrt(mean((tmax_pred$value-tmax_pred$LM.pred)^2,na.rm=TRUE))
+sqrt(mean((tmax_pred$value-tmax_pred$LM.predbias)^2,na.rm=TRUE))
+sqrt(mean((ma(tmax_pred$value_impute,window=7)-tmax_pred$LM.pred)^2,na.rm=TRUE))
+sqrt(mean((ma(tmax_pred$value_impute,window=7)-tmax_pred$LM.predbias)^2,na.rm=TRUE))
+
+
+fig<-plot_ly(data=tmax_pred,x=~value_impute,type="histogram",histnorm="probability",name="ori")
+fig <- fig %>% add_trace(data=tmax_pred,x=~LM.pred,type="histogram",histnorm="probability",name="LM")
+fig <- fig %>% add_trace(data=tmax_pred,x=~LM.predbias,type="histogram",histnorm="probability",name="LMbias")
+fig
+```
+
+## Combine results
+```{r}
+weather_data_complete_full<-bind_rows(weather_data_complete_washington,
+weather_data_complete_liestal,
+weather_data_complete_kyoto,
+weather_data_complete_vancouver) %>%
+select(id,location,date,year,qtr,month,day_num,doy,
+         tmin,tavg,tmax,tmax_impute,tmax_LM_pred,tmax_LM_predbias,prcp,snow,snwd)
+       #,tobs,dapr,mdpr,dasf,mdsf,wesd,wdfg,wsfg,wt01,wt03,wt04,wt05,wt06,wt11)
+```
+
+```{r}
+loc <- unique(weather_data_complete_full$location)[4]
+
+plt_data <- weather_data_complete_full %>% 
+                 filter(location==loc)
+fig <- plot_ly(data=plt_data,
+               x=~date,
+               y=~tmax,
+               type="scatter",
+               mode="lines",
+               name="tmax")
+fig <- fig %>% add_trace(data=plt_data,
+                         x=~date,
+                         y=~tmax_LM_predbias,
+                         type="scatter",
+                         mode="lines",
+                         name="tmax.LM.Pred") %>% layout(title=paste0(loc," (tmax)"))
+fig
+```
+
+
+## Output NOAA data
+```{r}
+write.csv(weather_data_complete_full,"../data/NOAA.csv",row.names = FALSE)
+```
+
+
+```{r}
+TRUE
+```

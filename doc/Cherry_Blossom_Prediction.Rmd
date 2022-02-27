@@ -1,0 +1,486 @@
+---
+title: "Cherry Blossom Predictions"
+author: "Steven Lio"
+date: "2/27/2022"
+output:
+  #pdf_document: 
+    #fig_caption: yes
+  html_document: default
+---
+```{r include=FALSE,echo=FALSE,message=FALSE,warning=FALSE}
+rm(list = ls()) 
+cat("\\014")
+```
+
+```{r global_options, include=FALSE}
+library(ggplot2)
+library(plotly)
+library(tidyverse)
+library(broom)
+library(lubridate)
+library(forecast)
+
+mode = "html"
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This document show case the model process for the 2022 Cherry Blossom Prediction Competition from the Department of Statistics at the School of Computing at George Mason University, Virginia, detail can be find **[here]**(https://competition.statistics.gmu.edu/competition-rules/). The objective of this model is to predict the Cherry Blossom day in four locations Kyoto(Japan), Liestal-Weideli(Switzerland), Washington DC (USA) and Vancouver(Canada) from 2022 to 2031. The data used in this project is mainly the historical Cherry Blossom date data in each location (except Vancouver) as well as NOAA's weather data (daily max temperature) given by NOAA's API in R (rnoaa) package. For Vancouver, a proxy data is collected from 2004 using Google Trend which indicates the popularity of the search term related to Cherry Blossom in British Columnba or Vancouver.
+
+The original scripts and data used in this document can be found in this GitHub repo **[here]**(https://github.com/stevenlio88/peak-bloom-prediction).
+
+
+## Data Preparation and EDA
+
+## Load Cleaned NOAA Data for each Location
+
+NOAA were retrieved and processed from the `NOAA Weather Data.Rmd` process and raw csv file is located in `data/NOAA.csv`. Simple temperature (daily max ) and other meteorological variables were pulled using `NOAA`'s API. The main variable used is `tmax` - daily max temperature from 1950 and missing data were first imputed using previous/next year values for long period missing data and short term data were imputed (`tmax_impute`) using regression method. Daily max temperature is also predicted using simple regression model (with seasonal terms - `tmax_LM_pred` and `tmax_LM_predbias`) onward up to 2031-12-31 for Cherry Blossom prediction. `tmax_LM_pred` is raw prediction from Linear Regression and `tmax_LM_predbias` added random noise to correct regression bias. Both variables will be evaluate against predicting Cherry Bloom date.
+
+```{r}
+weather_data_complete_full <- read.csv("../data/NOAA.csv")
+knitr::kable(head(weather_data_complete_full), caption = "An example of NOAA data.")
+```
+
+## Historical Cherry Blossom data
+
+This model process will be focus on predicting the day of the year for which the Cherry Blossom for each location. Official data is available for Washington DC(US), Liestal(Switzerland) and Kyoto(Japan). For Vancouver(Canada), annual cherry blossom date is not officially available. The Vancouver data is obtained from 2004 using Google Trend of people who searches Cherry Blossom related terms to best estimate the cherry blossom period in hope to confine the Cherry Blossom prediction to a specific period (potential problem would be the definition of Cherry Blossom is not the same as the other locations and also there maybe a delay effect i.e. Cherry Blossom before people searches on Google). The Google Trend data is collected manually and the compilation script can be found in `GoogleTrend_Vancouver.R`. The Cherry Blossom data is then compiled and merge with NOAA's data in this following script:
+
+```{r echo=FALSE,message=FALSE,warning=FALSE}
+cherry <- bind_rows(read.csv("../data/washingtondc.csv"),
+                    read.csv("../data/liestal.csv"),
+                    read.csv("../data/kyoto.csv"),
+                    read.csv("../data/vancouver.csv")) %>% 
+  mutate(location=case_when(location=="washingtondc"~"Washington DC",
+                            location=="liestal"~"Liestal",
+                            location=="kyoto"~"Kyoto",
+                            location=="vancouver"~"Vancouver"))
+cherry_full <- full_join(
+  weather_data_complete_full,
+  cherry, by = c("date"="bloom_date","location"="location")) %>%
+    group_by(location) %>%
+    fill(lat,long,alt,.direction="downup") %>%
+    ungroup() %>%
+    mutate(year=year.x, bloom_status=ifelse(is.na(bloom_doy),0L,1L)) %>%
+    mutate(bloom_status=ifelse(location=="Vancouver" & year < 2004, NA, bloom_status)) %>%
+    filter(year >= 1950) %>%
+    select(-year.y, -year.x)
+
+cherry_full$location <- as.factor(cherry_full$location)
+cherry_full$bloom_status <- as.factor(cherry_full$bloom_status)
+
+knitr::kable(head(cherry_full), caption = "Base table for model")
+```
+
+Prediction of Daily Max Temperature from each location
+
+```{r echo=FALSE,message=FALSE,warning=FALSE, fig.cap="Daily Max Temperature (NOAA) with predictions",fig.align = "center"}
+tplot<-ggplot(data=cherry_full %>% filter(year>=2010), aes(x=as.Date(date),y=tmax,color=location)) +
+  geom_line() + 
+  geom_line(data=cherry_full %>% filter(year>=2021), aes(x=as.Date(date),y=tmax_LM_predbias),linetype = "dashed",color = "red") +
+  facet_grid(rows=vars(location)) +
+  ggtitle("Daily Max Temperature from 2010", subtitle="Predictions in Red") + 
+  labs(x="Date", y="Daily Max Temperture (C)") + 
+  theme_minimal() + 
+  theme(plot.title=element_text(hjust=0.5, face="bold"),
+        plot.subtitle=element_text(hjust=0.5),
+        legend.position="none") 
+
+if(mode=="pdf"){
+  tplot
+} else {
+  ggplotly(tplot)
+}
+```
+
+## Custom defined Moving Average Function:
+
+```{r}
+#' Custom Moving Average Calculation
+#'
+#' @param x - Time Series sequence data
+#' @param window -k-Moving Average Window
+#' @param method -Average Calculation method: center-value average around current value, forward-average to future k values, backward-average to previous k value
+#'
+#' @return - Moving Averaged time series data
+#' @export
+#'
+#' @examples
+#' x <- 1:10
+#' y <- ma(x,window=3,method="center")
+#' y
+#' > 2.5 3.0 3.5 4.0 5.0 6.0 7.0 7.5 8.0 8.5
+ma<-function(x, window=5, method="center"){
+  ma_x <- c()
+  
+  for (i in 1:length(x)){
+    if (method=="center"){
+      ma_x[i]<-mean(x[max(1,i-window):min(length(x),i+window)],na.rm=TRUE)
+      ma_x[i]<-ifelse(is.na(ma_x[i]),NA,ma_x[i])
+    } else if (method=="forward") {
+      ma_x[i]<-mean(x[max(1,j-window+1):j],na.rm=TRUE)
+      ma_x[i]<-ifelse(is.na(ma_x[i]),NA,ma_x[i])
+    } else if (method=="backward") {
+      ma_x[i]<-mean(x[length(x):1][max(1,j-window+1):j],na.rm=TRUE)
+      ma_x[i]<-ifelse(is.na(ma_x[i]),NA,ma_x[i])
+    }
+  }
+  return(ma_x)
+}
+```
+
+## Custom defined Lag function:
+
+```{r}
+#' Lag function
+#'
+#' @param x - input sequential data
+#' @param lag - k-lag
+#'
+#' @return lag (shifted) k number of previous values
+#' @export
+#'
+#' @examples
+my_lag <- function(x, lag=1){
+  return(c(rep(NA,lag),x[1:(length(x)-lag)]))
+}
+```
+
+\newpage
+
+# Exploratory Data Analysis (EDA)
+
+A quick view on the historical cherry blossom day distribution by each location. We can see that the cherry blossom day is most in-consistence (highest variance) among the four locations over the years.
+
+Summary statistics regarding Cherry Bloom Day in each location:
+
+```{r echo=FALSE,message=FALSE,warning=FALSE}
+knitr::kable(cherry_full %>%  
+  group_by(location) %>%
+  summarize(`Number of observations`=length(unique(year)),
+            `Earliest Year`= min(ifelse(is.na(bloom_doy),NA,year),na.rm=TRUE),
+            `Average Bloom Day`=mean(bloom_doy,na.rm=TRUE),
+  `Standard Deviation of Bloom Day`=sd(bloom_doy,na.rm=TRUE)) %>% 
+  mutate_if(is.numeric,round,2), caption = "Cherry blossom day statistics")
+```
+
+```{r echo=FALSE, Message=FALSE, warning=FALSE, fig.cap="Historical Cherry Blossom Day Density Plot",fig.align = "center"}
+tdist<-ggplot(cherry_full, aes(x=bloom_doy,fill=location)) +
+  geom_histogram(aes(y=..density..)) + 
+  facet_wrap(~location) +
+  ggtitle("Cherry Blossom Day Distribution by Location") +
+  labs(x="Bloom Day (Day of Year)", y="Density") +
+  theme_minimal() + 
+  theme(plot.title=element_text(hjust=0.5, face="bold"),
+        plot.subtitle=element_text(hjust=0.5),
+        legend.position="none") 
+
+if(mode=="pdf"){
+  tdist
+} else {
+  ggplotly(tdist)
+}
+```
+
+```{r include=FALSE, echo=FALSE, warning=FALSE, message=FALSE}
+cherry_full_yearly <- cherry_full %>% 
+  group_by(location, year) %>%
+  summarize(avg_tmax = mean(ifelse(is.na(tmax_impute),tmax_LM_pred,tmax_impute)),
+            tol_prcp = sum(ifelse(is.na(prcp),0,prcp)),
+            tol_snow = sum(ifelse(is.na(snow),0,snow)),
+            bloom_doy = max(ifelse(is.na(bloom_doy),0,bloom_doy))) %>%
+  mutate(bloom_doy = ifelse(bloom_doy==0,NA,bloom_doy)) %>%
+  ungroup()
+
+cherry_full_yearly$avg_tmax_last1 <- my_lag(cherry_full_yearly$avg_tmax)
+cherry_full_yearly$tol_prcp_last1 <- my_lag(cherry_full_yearly$tol_prcp)
+
+cherry_full <- left_join(cherry_full,cherry_full_yearly, by=c("location"="location","year"="year")) %>%
+  select(-avg_tmax,-tol_prcp,-tol_snow,-bloom_doy.y)
+
+colnames(cherry_full) <- ifelse(colnames(cherry_full)=="bloom_doy.x","bloom_doy",colnames(cherry_full))
+```
+
+\newpage
+
+From below graphs we see the bloom date over the years generally been pushed earlier and coincided with warmer average temperature in recent years except for Vancouver which has seen cooler average temperature in recent year and the estimated bloom date has been pushed back. Kyoto has most consistence bloom date and Liestal has most variance in the bloom date over the years.
+
+```{r warning=FALSE,echo=FALSE,message=FALSE, fig.cap="Historical Cherry Blossom Day colored with Previous Year's Average Daily Max Temperature",fig.align = "center"}
+cherry_blossom <-ggplot(cherry_full_yearly, aes(x=year,y=bloom_doy,color=avg_tmax_last1)) +
+  geom_point() + 
+  facet_wrap(~location) +
+  ggtitle("Historical Cherry Blossom Day") +
+  labs(x="Year", y="Bloom Day (Day of Year)",color="Avg. Daily \n Max Temp") +
+  theme_minimal() + 
+  theme(plot.title=element_text(hjust=0.5, face="bold"),
+        plot.subtitle=element_text(hjust=0.5)) 
+
+if(mode=="pdf"){
+  cherry_blossom
+} else {
+  ggplotly(cherry_blossom)
+}
+```
+\newpage
+
+This following graph shows how the annual average daily max temperature has been changing especially in Liestal and Kyoto where it has been increasing steadily but in Vancouver saw decreases while Washington DC seems to be relatively stable compares to other locations.
+
+```{r warning=FALSE,echo=FALSE,message=FALSE, fig.cap="Annual Average Daily Max Temperature Trend",fig.align = "center"}
+annual_temp <-ggplot(cherry_full_yearly %>% filter(year <= 2021), aes(x=year,y=avg_tmax,color=location)) +
+  geom_point() + 
+  facet_wrap(~location, scales="free") +
+  ggtitle("Annual Average Daily Max Temperature") +
+  labs(x="Year", y="Daily Max Temperature (C)") +
+  theme_minimal() + 
+  theme(plot.title=element_text(hjust=0.5, face="bold"),
+        plot.subtitle=element_text(hjust=0.5),
+        legend.position="none",
+        legend.title = element_blank()) 
+
+if(mode=="pdf"){
+  annual_temp
+} else {
+  ggplotly(annual_temp)
+}
+```
+
+\newpage
+
+From the graph below we can see that the annual average daily max temperature from previous year has different level of effects on the cherry bloom day in each location, could be problem with the temperature data and also the average temperature is not the best indicator here for all locations.
+
+```{r warning=FALSE,echo=FALSE,message=FALSE, fig.cap="Historical Cherry Blossom Day against previous year's average daily max temperature",fig.align = "center"}
+doy_temp <-ggplot(cherry_full_yearly, aes(x=avg_tmax_last1,y=bloom_doy,color=location)) +
+  geom_point() + 
+  facet_wrap(~location, scales="free") +
+  ggtitle("Previous Year Avg. Daily Max Temperature vs Bloom Day") +
+  labs(x="Daily Max Temperature (C)", y="Bloom Day (Day of Year)") +
+  theme_minimal() + 
+  theme(plot.title=element_text(hjust=0.5, face="bold"),
+        plot.subtitle=element_text(hjust=0.5),
+        legend.position="none",
+        legend.title = element_blank()) 
+
+if(mode=="pdf"){
+  doy_temp
+} else {
+  ggplotly(doy_temp)
+}
+```
+
+\newpage
+
+## Basic Logistic Regression - Predicting probability of Cherry Blossom day
+
+Basic Logistic Regression (greedy method) and constraint to only the first 120 days of the year using `location x year x doy (Day of Year)` interaction terms. The basic model will first assume there is no way Cherry will bloom in the second half of the year in all locations.
+
+```{r echo=FALSE,message=FALSE,warning=FALSE}
+cherry_LR_df <- cherry_full %>% 
+                      filter(year <= 2021 & doy <= 120) %>%
+                      select(location,year,doy,bloom_status,bloom_doy)
+
+cherry_LR_df$bloom_status <- as.factor(cherry_LR_df$bloom_status)
+cherry_LR_df$doy <- as.factor(cherry_LR_df$doy)
+
+if (!file.exists("../model/LR_mode.rds")){
+  base_model <- glm(bloom_status ~ doy*year*location, data=cherry_LR_df, family=binomial(link="logit"))
+  saveRDS(base_model, "../model/LR_mode.rds")
+} else {
+  base_model <- readRDS("../model/LR_mode.rds")
+}
+```
+
+## Predictions
+
+```{r echo=FALSE,message=FALSE,warning=FALSE}
+LR_pred_df <- expand_grid(location = unique(cherry_LR_df$location),
+                           year = 1950:2032,
+                           doy=as.factor(1:120)
+                       ) %>%  
+  bind_cols(pred_prob = predict(base_model, newdata = .,type="response")) 
+
+LR_pred_df <- LR_pred_df %>% 
+  group_by(location,year) %>%
+  mutate(pred_status = ifelse(pred_prob==max(pred_prob),1, 0),
+         pred_doy = ifelse(pred_prob==max(pred_prob),seq(1, 120)[pred_prob==max(pred_prob)],NA))
+
+LR_pred_df <- left_join(LR_pred_df,cherry_LR_df %>% filter(!is.na(bloom_doy)),by=c("location"="location","year"="year"))
+LR_pred_df$location <- as.factor(LR_pred_df$location)
+```
+
+Model Prediction Accuracy (Average Absolute Bloom Day Difference)
+
+```{r echo=FALSE,message=FALSE,warning=FALSE}
+knitr::kable(LR_pred_df %>% 
+  select(location,year,pred_doy,bloom_doy) %>%
+  group_by(location,year) %>%
+  summarize(pred_doy=max(ifelse(is.na(pred_doy),0,pred_doy)), bloom_doy=max(ifelse(is.na(bloom_doy), 0, bloom_doy))) %>%
+  mutate(bloom_doy=ifelse(bloom_doy==0,NA,bloom_doy)) %>%
+  group_by(location) %>%
+  summarize(abs_doy_diff = round(mean(abs(bloom_doy - pred_doy),na.rm=TRUE),1)), caption = "Model prediction statistics")
+```
+
+Visualize Model Prediction
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.cap="Logistic Regression Model Predictions",fig.align = "center"}
+LR_pred<-LR_pred_df %>% 
+  filter(year >= 1950 & !is.na(pred_doy)) %>%
+  ggplot() +
+  geom_point(aes(x=year,y=bloom_doy,color=location)) + 
+  geom_line(aes(x=year,y=pred_doy,color=location)) + 
+  facet_wrap(~location, scales="free") +
+  ggtitle("Cherry Bloom day Prediction vs. Actual") +
+  labs(x="Year", y="Bloom Day (Day of Year)") +
+  theme_minimal() + 
+  theme(plot.title=element_text(hjust=0.5, face="bold"),
+        plot.subtitle=element_text(hjust=0.5),
+        legend.position="none",
+        legend.title = element_blank()) 
+
+if(mode=="pdf"){
+  LR_pred
+} else {
+  ggplotly(LR_pred)
+}
+```
+Robust logistic regression is probably not the best for this tasks as it fails to capture the different variances of the cherry bloom day in each year and it takes quite a lot of computation resource as expected since it has to calculate many interaction terms.
+
+## Seasonal Regression Model (Annual Trend)
+
+The seasonal regression model tries to naively break down the annual cherry blossom date as a time series data and model through sine and cosine terms along with previous average daily max temperature from previous year. Also data used to model in each location will be varied but mostly data from 2000 will be used. As this naive approach work best for short term time series modelling as well as prediction.
+
+Model process is wrapped into a function to make prediction in each locations:
+
+```{r warning=FALSE, message=FALSE}
+#' Wrapper for Seasonal Regression Model
+#'
+#' @param data -Input data frame (cherry_full)
+#' @param model_year_from -Earliest data year used in model
+#' @param loc -Location of the prediction
+#' @param max_freq_level -Hyper-parameter to control number of Fourier Frequency terms to use
+#'
+#' @return
+#' @export
+#'
+#' @examples
+Seasonal_model <- function(data, model_year_from=0, loc, max_freq_level=0.5) {
+
+  data_df <- data %>% 
+    filter(location == loc & year >= model_year_from & !is.na(bloom_doy)) %>%
+    select(location,year,bloom_doy,avg_tmax_last1) %>%
+    mutate(year_num = 1:n())
+
+  ssp <- spectrum(data_df$bloom_doy, plot=FALSE)
+  n_per <- floor(0.5*length(ssp$freq))
+  per <- 1/ssp$freq[order(-ssp$spec)][1:n_per]
+  sincos <-""
+  for (i in 1:length(per)){
+    sincos<-paste(sincos, "+sin(2*pi/",per[i],"*year_num)+cos(2*pi/",per[i],"*year_num)",sep="")
+  }
+  
+  if (loc %in% c("Kyoto","Washington DC")){
+    Linear <- lm(as.formula(paste0("bloom_doy~",sincos,"+year_num")),data=data_df)
+  } else {
+  Linear <- lm(as.formula(paste0("bloom_doy~",sincos,"+year_num+avg_tmax_last1")),data=data_df)
+  }
+  
+  pred_df <- left_join(tibble(location = loc,
+                           year = min(data_df$year):2031,
+                           year_num=1:length(year)),
+                       data %>%
+                         filter(year>=min(data_df$year) & location==loc) %>%
+                         select(location,year,avg_tmax_last1) %>% unique(),
+                       by=c("location"="location","year"="year")) %>%  
+              bind_cols(pred_doy = round(predict(Linear, newdata = .),0))
+
+  pred_df <- left_join(pred_df,data_df %>% filter(!is.na(bloom_doy)),by=c("location"="location","year"="year")) %>% 
+    select(-year_num.x,-avg_tmax_last1.y) %>% 
+    mutate(year_num=year_num.y,
+           avg_tmax_last1=avg_tmax_last1.x)
+  
+  return(pred_df)
+}
+```
+
+Combining the prediction results:
+
+```{r echo=FALSE,message=FALSE,warning=FALSE}
+cherry_seasonal_pred <- bind_rows(
+  Seasonal_model(cherry_full, model_year_from=2000, loc="Washington DC" ,max_freq_level=0.2),
+  Seasonal_model(cherry_full, model_year_from=2003, loc="Liestal" ,max_freq_level=0.05),
+  Seasonal_model(cherry_full, model_year_from=2000, loc="Kyoto" ,max_freq_level=0.05),
+  Seasonal_model(cherry_full, model_year_from=2007, loc="Vancouver" ,max_freq_level=0.3)
+)
+
+cherry_seasonal_pred$location <- as.factor(cherry_seasonal_pred$location)
+
+knitr::kable(cherry_seasonal_pred %>% 
+  select(location,year,pred_doy,bloom_doy) %>%
+  group_by(location) %>%
+  summarize(abs_doy_diff = mean(abs(bloom_doy - pred_doy),na.rm=TRUE),
+            avg_pred_doy = mean(pred_doy),
+            sd_pred_doy = sd(pred_doy),
+            avg_doy = mean(bloom_doy,na.rm=TRUE),
+            sd_doy = sd(bloom_doy,na.rm=TRUE)) %>%
+  mutate_if(is.numeric,round,1), caption = "Model prediction statistics")
+```
+As we can see our prediction have the average absolute different from each location that is much less than the standard deviation of the actual blossom day. But this model technique is prone to over fitting as forcing sine and cosine terms in modelling time series using regression can over-fit data which leads to false sense of a good model. But the following graph is hope to shows that this naive model is able to capture the short term (as most of the changes happening in recent years) and made appropriate prediction of the future. The appropriate amount of sine and cosine term (with varies frequency term) were control and selected to act as provide some sort of variance in the data.
+
+```{r echo=FALSE,warning=FALSE,message=FALSE, fig.cap="Seasonal Model Prediction",fig.align = "center"}
+seasonal_pred <- cherry_seasonal_pred %>%
+  ggplot() +
+  geom_point(aes(x=year,y=bloom_doy,color=location)) + 
+  geom_line(aes(x=year,y=pred_doy,color=location)) + 
+  facet_wrap(~location, scales="free") +
+  ggtitle("Cherry Bloom day Prediction vs. Actual") +
+  labs(x="Year", y="Bloom Day (Day of Year)") +
+  theme_minimal() + 
+  theme(plot.title=element_text(hjust=0.5, face="bold"),
+        plot.subtitle=element_text(hjust=0.5),
+        legend.position="none",
+        legend.title = element_blank()) 
+
+if(mode=="pdf"){
+  seasonal_pred
+} else {
+  ggplotly(seasonal_pred)
+}
+```
+If we were to interpret this model and inference about the future of cherry blossom (highly advice not to), then we are concluding that the Cherry Bloom day in Kyoto and Liestal will see the bloom day to be push forward to earlier in the year while Vancouver will be push back to later in the year (also given the average daily max temperature has been colder in Vancouver) while Washington DC remains the same and slightly pushed back. Given the data used in this model building process and the exploratory data analysis, it is consistence to conclude that temperature does have some correlation with how the date of Cherry bloom is change in different location for different species of Cherry trees.
+
+The amount of data is available for these model is only enough to make a rough prediction on where the future of the Cherry bloom day will be, but a big part of it does relying on how much we predict the future temperature in each location is going to be. Also the "seasonal" effect is artificial and does not conclude that the Cherry blossom day in previous year will have a direct impact in the next year's bloom day. The object of this process is to aim to predict the nearest possible Cherry Blossom day in each location using historical data and predicted annual average daily max temperature.
+
+The final prediction from the year 2022 to 2031 using the seasonal model is given by this following:
+
+```{r echo=FALSE,message=FALSE,warning=FALSE}
+cherry_export <- cherry_seasonal_pred %>% 
+  filter(year>=2022) %>%
+  select(year,location, pred_doy) %>%
+  mutate(location=case_when(
+    location=="Washington DC"~"washingtondc",
+    location=="Vancouver"~"vancouver",
+    location=="Liestal"~"liestal",
+    location=="Kyoto"~"kyoto"
+  )) %>%
+  pivot_wider(id_cols=year,
+              names_from=location,
+              values_from=pred_doy) %>%
+  select(year,kyoto,liestal,washingtondc,vancouver)
+
+knitr::kable(cherry_export, caption = "Cherry Blossom Predictions")
+```
+
+
+Export to csv:
+
+```{r}
+write.csv(cherry_export,"../cherry-predictions.csv",row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
