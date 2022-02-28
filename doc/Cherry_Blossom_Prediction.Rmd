@@ -3,10 +3,10 @@ title: "Cherry Blossom Predictions"
 author: "Steven Lio"
 date: "2/27/2022"
 output:
-  #pdf_document: 
-    #fig_caption: yes
-  html_document: default
-always_allow_html: yes
+  pdf_document: 
+    fig_caption: yes
+  #html_document: default
+#always_allow_html: yes
 ---
 ```{r include=FALSE,echo=FALSE,message=FALSE,warning=FALSE}
 rm(list = ls()) 
@@ -21,13 +21,13 @@ library(broom)
 library(lubridate)
 library(forecast)
 
-mode = "html"
+mode = "pdf"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
 # Introduction
 
-This document show case the model process for the 2022 Cherry Blossom Prediction Competition from the Department of Statistics at the School of Computing at George Mason University, Virginia, detail can be find **[here]**(https://competition.statistics.gmu.edu/competition-rules/). The objective of this model is to predict the Cherry Blossom day in four locations Kyoto(Japan), Liestal-Weideli(Switzerland), Washington DC (USA) and Vancouver(Canada) from 2022 to 2031. The data used in this project is mainly the historical Cherry Blossom date data in each location (except Vancouver) as well as NOAA's weather data (daily max temperature) given by NOAA's API in R (rnoaa) package. For Vancouver, a proxy data is collected from 2004 using Google Trend which indicates the popularity of the search term related to Cherry Blossom in British Columnba or Vancouver.
+This document show case the model process for the 2022 Cherry Blossom Prediction Competition from the Department of Statistics at the School of Computing at George Mason University, Virginia, detail can be find **[here]**(https://competition.statistics.gmu.edu/competition-rules/). The objective of this model is to predict the Cherry Blossom day in four locations Kyoto(Japan), Liestal-Weideli(Switzerland), Washington DC (USA) and Vancouver(Canada) from 2022 to 2031. The data used in this project is mainly the historical Cherry Blossom date data in each location (except Vancouver) as well as NOAA's weather data (daily max temperature) given by NOAA's API in R (rnoaa) package. For Vancouver, a proxy data is collected from 2004 using Google Trend which indicates the popularity of the search term related to Cherry Blossom in British Columbia or Vancouver.
 
 The original scripts and data used in this document can be found in this GitHub repo **[here]**(https://github.com/stevenlio88/peak-bloom-prediction).
 
